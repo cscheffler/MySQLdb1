@@ -13,6 +13,16 @@ from _mysql_exceptions import Warning, Error, InterfaceError, DataError, \
 import types, _mysql
 import re
 
+TRACE_SQL = True  # Toggle this to switch SQL query tracing on or off
+TRACE_SQL_SAMPLE_PERIOD = 1000  # Log 1 out of every 1000 queries
+
+if TRACE_SQL:
+    import traceback
+    try:
+        from tal.core.monitor.event_stream import send as send_event
+    except ImportError:
+        TRACE_SQL = False
+
 
 def defaulterrorhandler(connection, cursor, errorclass, errorvalue):
     """
@@ -58,7 +68,7 @@ class Connection(_mysql.connection):
     """MySQL Database Connection Object"""
 
     default_cursor = cursors.Cursor
-    
+
     def __init__(self, *args, **kwargs):
         """
 
@@ -191,6 +201,13 @@ class Connection(_mysql.connection):
         
         self._server_version = tuple([ numeric_part(n) for n in self.get_server_info().split('.')[:2] ])
 
+        if TRACE_SQL:
+            import os
+            import socket
+            self._sql_trace_counter = 0
+            self._sql_trace_cwd = os.getcwd()  # Current working directory
+            self._sql_trace_hostname = socket.gethostname()  # Host name
+
         db = proxy(self)
         def _get_string_literal():
             def string_literal(obj, dummy=None):
@@ -322,7 +339,52 @@ class Connection(_mysql.connection):
         r = self.store_result()
         warnings = r.fetch_row(0)
         return warnings
-    
+
+    def query(self, sql):
+        if TRACE_SQL:
+            self._sql_trace_counter += 1
+            if self._sql_trace_counter % TRACE_SQL_SAMPLE_PERIOD == 0:
+                self._sql_trace_counter = 0
+                analyze = True
+            else:
+                analyze = False
+
+            if analyze:
+                # Time the query
+                import time
+                start_time = time.time()
+
+        # Do query
+        _mysql.connection.query(self, sql)
+
+        if TRACE_SQL and analyze:
+            # Wrapping all of this in a try block so we don't ever break
+            # the query() call
+            try:
+                query_time = time.time()
+
+                # Get stack trace. Exclude ourselves from the call stack. Also
+                # limit to at most 15 entries, to save some time.
+                stack = traceback.extract_stack(limit=16)[:-1]
+
+                stop_time = time.time()
+
+                # Write to event stream
+                send_event(
+                    channel='mysql_trace',
+                    typ='mysql_trace',
+                    payload={
+                        'host': self._sql_trace_hostname,
+                        'cwd': self._sql_trace_cwd,
+                        'stack': stack,
+                        'sql': sql,
+                        'query_time': query_time - start_time,
+                        'stats_time': stop_time - query_time,
+                    }
+                )
+            except:
+                pass
+
     Warning = Warning
     Error = Error
     InterfaceError = InterfaceError
